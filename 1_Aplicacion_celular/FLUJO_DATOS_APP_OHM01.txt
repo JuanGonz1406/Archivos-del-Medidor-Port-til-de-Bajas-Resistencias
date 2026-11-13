@@ -1,0 +1,464 @@
+FUNCIONAMIENTO Y FLUJO DE DATOS DE LA APLICACIÓN OHM01
+====================================================
+
+Documento basado en el código actual del proyecto Flutter.
+Describe los datos que recibe la aplicación, su procesamiento, la información
+que presenta en la interfaz y su envío a Supabase.
+
+1. RESUMEN DEL SISTEMA
+---------------------
+El instrumento entrega lecturas del ADC y estados digitales a través del
+ESP-01. El teléfono recibe estos datos por Wi-Fi mediante UDP. La aplicación
+valida cada trama, calcula resistencia, voltajes y estado de batería, actualiza
+la interfaz y permite guardar una captura en Supabase por Internet.
+
+Flujo general:
+
+Instrumento / ESP-01
+  -> Trama ASCII por UDP en la red local
+  -> Validación de formato, coherencia y secuencia
+  -> Cálculos eléctricos y clasificación del estado
+  -> Visualización en la app y tendencia temporal en RAM
+  -> Captura manual o automática
+  -> JSON de nueve campos
+  -> Petición HTTPS POST a Supabase
+  -> Registro en la tabla measurements.
+
+La recepción UDP no requiere Internet; el envío y la consulta de Supabase sí
+requieren acceso al servidor. No se envía a la nube cada paquete recibido:
+se envía la lectura actual cuando corresponde una captura.
+
+2. QUÉ DATOS RECIBE LA APP
+-------------------------
+2.1. Medio de recepción
+
+- Protocolo: UDP sobre IPv4.
+- Puerto predeterminado: 4210, configurable desde Ajustes.
+- Dirección de escucha del teléfono: 0.0.0.0, es decir, todas sus interfaces IPv4.
+- Destino broadcast previsto para el ESP-01: 255.255.255.255:4210.
+- También puede recibir un datagrama dirigido directamente a la IP del teléfono.
+- El teléfono y el ESP-01 deben poder comunicarse dentro de la misma red local.
+- Cada datagrama debe contener exactamente una trama ASCII.
+
+2.2. Formato de la trama
+
+  D:seq,an0,an1,rb0,med_en\n
+
+Ejemplo:
+
+  D:104,2610,830,1,1\n
+
+En esta representación, \n significa un byte real de salto de línea LF.
+No se deben enviar literalmente los caracteres barra invertida y n.
+No se admite terminación CRLF, espacios ni varias tramas en un datagrama.
+
+Significado de los cinco campos:
+
+  seq:
+    Número de secuencia entero entre 0 y 65535. Permite identificar paquetes
+    duplicados, antiguos y saltos de secuencia.
+
+  an0:
+    Lectura ADC de batería, entero entre 0 y 4095. El protocolo del instrumento
+    espera un promedio entero de 32 muestras. La app recibe ese valor ya
+    promediado: no realiza de nuevo ese promedio.
+
+  an1:
+    Lectura ADC de la salida del amplificador INA333, entero entre 0 y 4095.
+    También se espera como promedio entero de 32 muestras.
+
+  rb0:
+    Estado digital: 0 significa carga activa; 1 significa que no está cargando.
+
+  med_en:
+    Estado digital de habilitación de medición: 1 habilitada; 0 deshabilitada.
+    Es un estado informado por el instrumento, no una orden enviada por la app.
+
+Además, el receptor obtiene la IP de origen del datagrama. La hora de recepción
+se genera en el teléfono; la trama no incluye una fecha ni una resistencia ya
+calculada.
+
+3. CÓMO VALIDA Y PROCESA LOS DATOS
+---------------------------------
+3.1. Validaciones de entrada
+
+El servicio UDP descarta datagramas de más de 96 bytes y datos que no sean ASCII.
+El parser rechaza tramas de más de 40 caracteres, formato incorrecto y valores
+fuera de los rangos permitidos.
+
+También se rechazan estas contradicciones físicas:
+
+- rb0 = 0 y med_en = 1: no se permite medir mientras está cargando.
+- rb0 = 1, an0 <= 2321 y med_en = 1: medición activa con batería demasiado baja.
+- rb0 = 1, an0 >= 2457 y med_en = 0: medición deshabilitada cuando debería estar
+  habilitada según los umbrales del instrumento.
+
+Entre los umbrales se respeta el estado med_en recibido, sin inventar un estado
+de histéresis a partir de una única lectura de voltaje. La protección física
+permanece en el firmware del PIC; la app no controla el pin RD0.
+
+3.2. Control de emisor y secuencia
+
+La app mantiene una sesión con la IP del emisor aceptado. Mientras la conexión
+está vigente, rechaza tramas procedentes de otra IP.
+
+La diferencia de secuencia se calcula en un contador circular de 16 bits:
+
+  delta = (secuencia_nueva - secuencia_anterior) módulo 65536
+
+- delta = 0: paquete duplicado; no actualiza la lectura.
+- delta >= 32768: paquete antiguo o fuera de orden; no actualiza la lectura.
+- Para una secuencia nueva se suman delta - 1 paquetes al contador de pérdidas.
+- El salto 65535 -> 0 se acepta como avance normal.
+
+Tras más de 2000 ms sin una muestra nueva válida, se permite redescubrir emisor
+y secuencia. Repetir la misma secuencia desde la misma IP no revive la conexión.
+También existe el botón "Reiniciar escucha" para restablecer la sesión.
+
+3.3. Conversión de ADC a magnitudes eléctricas
+
+Constantes utilizadas:
+
+- Referencia ADC: 3.000 V.
+- Escala ADC: 4095.
+- Factor del divisor de batería: 2.
+- Ganancia del INA333: 41.
+- Corriente de prueba supuesta: 60 mA.
+- Referencia del INA333 supuesta: 0 V.
+
+Fórmulas:
+
+  Vbat = 2 x an0 x 3.000 / 4095
+  Vout = an1 x 3.000 / 4095
+  VRx  = Vout / 41
+  Rbase = Vout / 2.46
+  Rcorregida = Rbase x correccion_ganancia + offset_ohm
+
+Vbat es el voltaje de batería, Vout la salida del INA333 y VRx el voltaje en la
+resistencia medida. El factor 2.46 corresponde a 41 x 0.060 A.
+Por defecto, la corrección de ganancia es 1 y el offset es 0 ohmios.
+Si la medición está habilitada y la resistencia corregida resulta negativa,
+se rechaza la trama y se informa un error de calibración; no se convierte a cero.
+
+3.4. Porcentaje de batería
+
+Se utiliza interpolación lineal entre estos puntos de voltaje y porcentaje:
+
+  3.40 V ->   0 %
+  3.50 V ->  10 %
+  3.60 V ->  20 %
+  3.70 V ->  40 %
+  3.80 V ->  55 %
+  3.90 V ->  70 %
+  4.00 V ->  80 %
+  4.10 V ->  90 %
+  4.20 V -> 100 %
+
+El resultado se redondea a un entero y se limita entre 0 y 100.
+No es una medición directa de capacidad ni un contador de carga.
+
+3.5. Estimación de tiempos
+
+Capacidad nominal utilizada: 3700 mAh.
+Corriente de carga supuesta: 1000 mA, con factor de corrección 1.15.
+Consumo del sistema predeterminado: 85 mA, configurable.
+
+  tiempo_carga_s = redondear(
+    3700 x (100 - porcentaje) / 100 / 1000 x 1.15 x 3600)
+
+  tiempo_descarga_s = redondear(
+    3700 x porcentaje / 100 / consumo_sistema_mA x 3600)
+
+Se utiliza el porcentaje entero calculado anteriormente. Los segundos se limitan
+al intervalo de 0 a 2147483647, compatible con el entero int4 de PostgreSQL.
+Durante carga solo se informa tiempo de carga; el tiempo de descarga es null.
+Sin carga solo se informa tiempo de descarga; el tiempo de carga es null.
+Son estimaciones: la carga real CC/CV y un consumo variable pueden modificarlas.
+
+3.6. Clasificación de estado
+
+La prioridad de clasificación es:
+
+  CHARGING -> LOW_BATTERY -> OVER_RANGE -> OK
+
+  CHARGING:
+    rb0 = 0. El instrumento está cargando y la medición está deshabilitada.
+
+  LOW_BATTERY:
+    No está cargando y med_en = 0. La medición está bloqueada por batería baja.
+
+  OVER_RANGE:
+    No está cargando, med_en = 1 y la resistencia corregida es mayor que 1 ohmio.
+
+  OK:
+    No está cargando, med_en = 1 y la resistencia está entre 0 y 1 ohmio.
+
+Solo el estado OK conserva una resistencia numérica en la medición procesada.
+En los otros tres estados, resistance_ohm se prepara como null.
+La trama no tiene un indicador independiente de puntas abiertas: estas solo
+pueden aparecer como OVER_RANGE si el circuito genera una lectura mayor a 1 ohmio.
+La clasificación se hace con precisión completa, antes del redondeo de salida.
+
+3.7. Actualización y pérdida de conexión
+
+Cada muestra aceptada actualiza la lectura actual y se agrega a una lista de
+hasta 180 muestras en RAM. La interfaz se refresca mediante un temporizador
+de 300 ms, no mediante un repintado por cada datagrama.
+
+Si pasan más de 2000 ms sin una muestra válida nueva, la lectura principal se
+oculta, se muestra DESCONECTADO y se bloquean nuevas capturas y envíos automáticos.
+Diagnóstico puede conservar la última lectura para inspección, marcada como
+una lectura que no se envía mientras esté desconectado.
+
+Al pasar la app a segundo plano se cierra UDP y se detiene la adquisición.
+Una petición HTTP ya iniciada puede terminar. Al regresar al primer plano se
+reinicia la escucha y se exige una trama nueva.
+
+4. QUÉ MUESTRA EN LA INTERFAZ
+----------------------------
+La aplicación tiene cuatro vistas en la barra de navegación inferior.
+
+4.1. Medición / Centro de medición
+
+- Identificación OHM01 e indicador de conexión.
+- Rango del instrumento: 0 a 1 ohmio.
+- Resistencia en ohmios con cuatro decimales o miliohmios con dos decimales.
+- Selector de unidad: ohmios o miliohmios. Este selector solo cambia la pantalla;
+  el valor enviado a Supabase siempre se expresa en ohmios.
+- Código de estado y descripción: Medición activa, Cargando, Batería baja o
+  Fuera de rango. Colores: verde, azul, rojo y naranja, respectivamente.
+- Guiones en lugar de resistencia si no existe una medición válida.
+- Batería: porcentaje, barra de nivel y voltaje con dos decimales.
+- Tiempo estimado de carga o autonomía, mostrado en horas y minutos.
+- Voltaje en Rx en mV con dos decimales y salida INA333 en V con tres decimales;
+  ambos se presentan como lecturas activas solamente cuando med_en = 1.
+- Botón "Capturar en Supabase", deshabilitado si no hay conexión al instrumento
+  o si ya existe un envío en curso.
+- Estado del envío automático y su intervalo.
+- Mensaje de sincronización, confirmación o error; avisos de conexión local.
+
+4.2. Diagnóstico
+
+- Estado de recepción, dirección de escucha y puerto UDP.
+- IP del emisor, paquetes por segundo y contadores de aceptados y perdidos.
+- Duplicados, fuera de orden y rechazados.
+- Última secuencia, edad de la muestra, AN0, AN1, RB0 y MED_EN.
+- Última trama recibida y botón "Reiniciar escucha".
+- Último código HTTP y fecha del último envío confirmado.
+- Contador de capturas sin confirmar y mensaje del servicio.
+- JSON de la lectura actual, con sus nueve campos.
+- Último JSON cuyo envío se intentó, para compararlo con la lectura actual.
+
+4.3. Historial
+
+- Gráfica de resistencia frente al tiempo con las últimas 180 muestras de la
+  sesión. Solo dibuja resistencias válidas y separa los tramos ante estados sin
+  resistencia o pausas entre muestras mayores de 2000 ms.
+- Hasta 100 registros remotos recientes del dispositivo OHM01, ordenados desde
+  el más nuevo. Cada tarjeta muestra resistencia o "Sin medición válida",
+  fecha y hora local, porcentaje de batería y estado.
+- Botón de actualización y actualización al deslizar hacia abajo.
+
+El historial se consulta al iniciar la app, al abrir esta vista y cuando se
+solicita actualizar. No se implementa una suscripción en tiempo real a Supabase.
+
+4.4. Ajustes
+
+- Puerto UDP: 1024 a 65535; predeterminado 4210.
+- Intervalo de envío: 1000 a 3600000 ms; predeterminado 5000 ms.
+- Interruptor de envío automático; activado por defecto.
+- Consumo del sistema: 0.001 a 100000 mA; predeterminado 85 mA.
+- Corrección de ganancia: 0.000001 a 1000; predeterminada 1.
+- Offset: -1 a 1 ohmio; predeterminado 0.
+- Guardar ajustes y restablecer valores del formulario.
+
+Los ajustes se guardan localmente con SharedPreferences. Al guardarlos se limpia
+la lectura actual y la tendencia y se espera una nueva trama. Si cambia el puerto,
+se reinicia la escucha. Restablecer el formulario no persiste los valores hasta
+pulsar "Guardar ajustes".
+
+5. CÓMO ENVÍA LOS DATOS A SUPABASE
+---------------------------------
+5.1. Cuándo se envían
+
+Captura manual:
+  El usuario pulsa "Capturar en Supabase". Se toma el estado procesado actual.
+
+Captura automática:
+  Está habilitada por defecto, con intervalo de 5000 ms. El controlador comprueba
+  las condiciones en el temporizador de 300 ms; no es un reloj de envío exacto.
+  Se exige conexión vigente, ausencia de otro envío en curso, intervalo cumplido
+  desde el último intento y una muestra distinta de la usada en la captura
+  automática anterior.
+
+Un estado CHARGING, LOW_BATTERY u OVER_RANGE también puede enviarse si proviene
+de telemetría válida y reciente; en ese caso la resistencia se envía como null.
+No hay peticiones de inserción simultáneas desde el controlador.
+
+5.2. Destino y petición HTTP
+
+La app usa directamente la API REST de Supabase mediante HTTPS:
+
+  Método: POST
+  URL predeterminada:
+  https://cnmyjbqtmhespicruvrk.supabase.co/rest/v1/measurements
+
+Cabeceras:
+
+  apikey: <clave pública configurada en SupabaseService>
+  Content-Type: application/json
+  Prefer: return=minimal
+
+La clave pública no se envía como Authorization: Bearer. No se incorpora una
+clave privada ni service_role. Por claridad, no se reproduce la clave en este
+documento; su configuración está en lib/services/supabase_service.dart.
+La URL y la clave pueden sustituirse al compilar mediante SUPABASE_URL y
+SUPABASE_PUBLISHABLE_KEY.
+
+El cuerpo se obtiene serializando la medición procesada como JSON.
+El tiempo máximo de espera de la petición es de 12 segundos.
+
+5.3. Los nueve campos del JSON
+
+  device_id:
+    Texto fijo "OHM01".
+
+  resistance_ohm:
+    Resistencia en ohmios redondeada a cuatro decimales cuando el estado es OK;
+    null en los otros estados.
+
+  battery_voltage_v:
+    Voltaje de batería redondeado a dos decimales.
+
+  battery_percent:
+    Porcentaje entero entre 0 y 100.
+
+  charging:
+    Booleano true si rb0 = 0; false si rb0 = 1.
+
+  charge_time_remaining_s:
+    Segundos estimados para completar la carga; null si no está cargando.
+
+  discharge_time_remaining_s:
+    Segundos estimados de autonomía; null si está cargando.
+
+  measurement_enabled:
+    Booleano true si med_en = 1; false si med_en = 0.
+
+  status:
+    Texto "OK", "CHARGING", "LOW_BATTERY" u "OVER_RANGE".
+
+No se envían seq, an0, an1, rb0, med_en como campos crudos, IP del emisor,
+voltaje del INA333, voltaje en Rx, hora local de recepción, id ni created_at.
+Los estados digitales sí quedan representados por los booleanos anteriores.
+
+5.4. Confirmación y fallos
+
+Solo una respuesta HTTP 201 confirma la inserción. La app muestra "Registro
+almacenado" y registra la hora de confirmación en el teléfono.
+
+Si llega otro código HTTP, se muestra el mensaje de error devuelto por Supabase
+cuando está disponible. Ante una excepción de red o tiempo agotado, se informa
+que la captura está sin confirmar. Se incrementa el contador correspondiente.
+
+No existe SQLite, cola offline ni reintento automático del mismo payload.
+El próximo intervalo puede intentar una captura nueva si existe telemetría
+fresca. Si el servidor insertó el registro pero su respuesta se perdió, la app
+no puede asegurar si esa captura quedó guardada.
+
+5.5. Almacenamiento y permisos del servidor
+
+El archivo supabase/setup.sql proporciona un esquema de referencia para la tabla
+public.measurements. Allí id es una identidad generada por PostgreSQL y
+created_at se genera con now() en el servidor. Por tanto, esa fecha corresponde
+al registro en la base de datos, no a una fecha transmitida por el instrumento.
+
+El esquema de referencia comprueba rangos de resistencia, voltaje y porcentaje,
+valores permitidos de estado y coherencia entre estado, carga, habilitación,
+resistencia nula y tiempos. Habilita RLS y políticas para INSERT y SELECT del
+rol anon. Estas políticas públicas no equivalen a autenticar el instrumento.
+
+Este documento describe el código y el SQL de referencia local; no confirma
+que el esquema o las políticas estén desplegados en el servidor remoto.
+
+5.6. Consulta del historial remoto
+
+Se realiza una petición GET al mismo recurso REST, con estos filtros:
+
+  device_id = eq.OHM01
+  order = created_at.desc
+  limit = 100
+
+Se seleccionan id, created_at, device_id, resistance_ohm, battery_voltage_v,
+battery_percent, charging y status. La petición también tiene un límite de
+12 segundos. Se exige HTTP 200 y se convierte la respuesta JSON a una lista.
+
+6. EJEMPLO COMPLETO DE UNA LECTURA
+---------------------------------
+Entrada UDP:
+
+  D:104,2610,830,1,1\n
+
+Suponiendo ajustes predeterminados y una secuencia nueva aceptada:
+
+  seq = 104
+  an0 = 2610
+  an1 = 830
+  rb0 = 1: no está cargando.
+  med_en = 1: medición habilitada.
+
+Resultados aproximados antes de redondear para el JSON:
+
+  Vbat = 3.824175824 V
+  Vout = 0.608058608 V
+  VRx = 0.014830698 V = 14.830698 mV
+  R = 0.247178296 ohmios
+  Porcentaje de batería = 59 %
+  Autonomía estimada = 92456 s
+  Estado = OK
+
+En la pantalla de medición se vería:
+
+  Resistencia: 0.2472 ohmios o 247.18 miliohmios.
+  Batería: 59 %, 3.82 V.
+  Voltaje en Rx: 14.83 mV.
+  Salida INA333: 0.608 V.
+  Autonomía: 25 h 40 min.
+  Estado: OK / Medición activa.
+
+El cuerpo del POST sería:
+
+  {
+    "device_id": "OHM01",
+    "resistance_ohm": 0.2472,
+    "battery_voltage_v": 3.82,
+    "battery_percent": 59,
+    "charging": false,
+    "charge_time_remaining_s": null,
+    "discharge_time_remaining_s": 92456,
+    "measurement_enabled": true,
+    "status": "OK"
+  }
+
+El porcentaje se calcula desde el voltaje sin redondear, no desde los 3.82 V
+mostrados en pantalla. Por eso esta trama produce 59 %, aunque evaluar exactamente
+3.82 V en la curva daría aproximadamente 58 %.
+
+7. ARCHIVOS QUE IMPLEMENTAN ESTE FLUJO
+-------------------------------------
+- lib/services/udp_service.dart:
+  Abre el socket UDP, recibe datagramas y decodifica ASCII.
+- lib/domain/measurement.dart:
+  Define ajustes, parser, secuencias, fórmulas, estados y JSON de salida.
+- lib/app_controller.dart:
+  Coordina recepción, watchdog, tendencia, ajustes, capturas e historial.
+- lib/ui/app.dart:
+  Implementa las cuatro vistas y la gráfica de tendencia.
+- lib/services/supabase_service.dart:
+  Realiza las inserciones POST y las consultas GET a Supabase.
+- supabase/setup.sql:
+  Contiene el esquema y las políticas de referencia para la base de datos.
+
+Nota final: solo los ajustes se guardan de forma persistente en el teléfono.
+Las mediciones y la tendencia local permanecen en memoria durante la sesión;
+la conservación remota depende de que la inserción en Supabase se complete.

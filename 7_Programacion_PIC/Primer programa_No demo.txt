@@ -1,0 +1,1453 @@
+/*
+ * =============================================================
+ * MEDIDOR DE BAJA RESISTENCIA 0 - 1 OHM
+ * PIC18F45K80
+ * mikroC PRO for PIC
+ * =============================================================
+ *
+ * ALIMENTACION: 3.0 V
+ *
+ * CONEXIONES:
+ *
+ * RA0 / AN0  pin 2  <- N_BAT
+ * RA1 / AN1  pin 3  <- VOLT_R
+ * RB0        pin 33 <- CHRG TP4056
+ * RC6 / TX1  pin 25 -> RXD ESP-01
+ * RC7 / RX1  pin 26 <- TXD ESP-01
+ * RD0        pin 19 -> MED_EN
+ *
+ * MEDICION RESISTENCIA:
+ *
+ * R5 = 20k
+ * R6 = 5k
+ * R7 = 10 ohm
+ *
+ * VSET = 3V * 5k/(20k+5k) = 0.6 V
+ * ITEST = 0.6V / 10 ohm = 60 mA
+ *
+ * INA333:
+ *
+ * RG = 2.5k
+ * G = 1 + 100k/2.5k = 41
+ *
+ * VOUT = 41 * 0.060 * R
+ * VOUT = 2.46 * R
+ *
+ * R = VOUT / 2.46
+ *
+ * BATERIA:
+ *
+ * LiPo = 3700 mAh
+ * Vmax = 4.2 V
+ * Vmin = 3.4 V
+ *
+ * Divisor = 22k / 22k
+ *
+ * VBAT = 2 * VAN0
+ *
+ * =============================================================
+ */
+
+
+/* =============================================================
+   CONFIGURACION
+   ============================================================= */
+
+#define CFG_DEVICE_ID             "OHM01"
+
+#define CFG_VDD_V                 3.000
+#define CFG_ADC_TOP               4095.0
+#define CFG_ADC_SAMPLE_COUNT      32
+
+#define CFG_BAT_CAPACITY_MAH      3700.0
+#define CFG_BAT_LOW_V             3.40
+#define CFG_BAT_RESTORE_V         3.60
+#define CFG_BAT_DIVISOR           2.0
+
+#define CFG_CHARGE_CURRENT_MA     1000.0
+#define CFG_CHARGE_TIME_FACTOR    1.15
+
+/*
+ * Todavia no conocemos el consumo promedio real.
+ * Cuando lo conozcamos sustituimos 0.0.
+ */
+#define CFG_SYSTEM_CURRENT_MA     0.0
+
+#define CFG_TEST_CURRENT_A        0.060
+#define CFG_INA_GAIN              41.0
+#define CFG_INA_REFERENCE_V       0.0
+
+#define CFG_MAX_RESISTANCE_OHM    1.0
+
+#define CFG_RES_GAIN_CORR         1.0000
+#define CFG_RES_OFFSET_OHM        0.0000
+#define CFG_BAT_GAIN_CORR         1.0000
+
+#define CFG_UPLOAD_DELAY_MS       5000
+
+
+/* =============================================================
+   WIFI
+   ============================================================= */
+
+#define CFG_WIFI_SSID             "TU_RED_WIFI"
+#define CFG_WIFI_PASSWORD         "TU_CLAVE_WIFI"
+
+
+/* =============================================================
+   SUPABASE
+   ============================================================= */
+
+#define CFG_SUPABASE_HOST \
+        "cnmyjbqtmhespicruvrk.supabase.co"
+
+#define CFG_SUPABASE_KEY \
+        "sb_publishable_PuFVcFURGHfgCLZB_rBNDQ_7xTDINvp"
+
+
+/* =============================================================
+   BUFFERS
+   ============================================================= */
+
+char app_json_buffer[450];
+char app_http_buffer[900];
+char app_command_buffer[180];
+char app_conversion_buffer[40];
+char app_state_buffer[32];
+
+
+/* =============================================================
+   VARIABLES DEL SISTEMA
+   ============================================================= */
+
+float app_battery_voltage;
+float app_resistance_ohm;
+
+unsigned short app_battery_percent;
+unsigned short app_is_charging;
+unsigned short app_measure_allowed;
+unsigned short app_resistance_valid;
+unsigned short app_low_battery_latch;
+unsigned short app_wifi_ready;
+
+long app_charge_seconds;
+long app_discharge_seconds;
+
+
+/* =============================================================
+   FUNCIONES PARA CADENAS
+   ============================================================= */
+
+void App_TrimLeft(char *source_buffer)
+{
+    unsigned short read_pos;
+    unsigned short write_pos;
+
+    read_pos = 0;
+    write_pos = 0;
+
+    while(source_buffer[read_pos] == ' ')
+    {
+        read_pos++;
+    }
+
+    while(source_buffer[read_pos] != 0)
+    {
+        source_buffer[write_pos] =
+            source_buffer[read_pos];
+
+        read_pos++;
+        write_pos++;
+    }
+
+    source_buffer[write_pos] = 0;
+}
+
+
+/* ------------------------------------------------------------- */
+
+void App_AppendInteger(char *destination_buffer,
+                       int number_value)
+{
+    IntToStr(number_value,
+             app_conversion_buffer);
+
+    App_TrimLeft(app_conversion_buffer);
+
+    strcat(destination_buffer,
+           app_conversion_buffer);
+}
+
+
+/* ------------------------------------------------------------- */
+
+void App_AppendLong(char *destination_buffer,
+                    long number_value)
+{
+    LongToStr(number_value,
+              app_conversion_buffer);
+
+    App_TrimLeft(app_conversion_buffer);
+
+    strcat(destination_buffer,
+           app_conversion_buffer);
+}
+
+
+/* ------------------------------------------------------------- */
+
+void App_AppendFloat(char *destination_buffer,
+                     float number_value)
+{
+    FloatToStr(number_value,
+               app_conversion_buffer);
+
+    App_TrimLeft(app_conversion_buffer);
+
+    strcat(destination_buffer,
+           app_conversion_buffer);
+}
+
+
+/* =============================================================
+   ADC
+   ============================================================= */
+
+unsigned int App_ADC_Average(unsigned short adc_channel)
+{
+    unsigned short sample_counter;
+    unsigned int adc_sample;
+    unsigned long adc_accumulator;
+
+    adc_accumulator = 0;
+
+    /*
+     * Primera conversion descartada.
+     */
+    adc_sample =
+        ADC_Read(adc_channel);
+
+    Delay_us(100);
+
+    for(sample_counter = 0;
+        sample_counter < CFG_ADC_SAMPLE_COUNT;
+        sample_counter++)
+    {
+        adc_sample =
+            ADC_Read(adc_channel);
+
+        adc_accumulator +=
+            adc_sample;
+
+        Delay_us(100);
+    }
+
+    return
+        (unsigned int)
+        (adc_accumulator /
+         CFG_ADC_SAMPLE_COUNT);
+}
+
+
+/* =============================================================
+   MEDICION DE BATERIA
+   ============================================================= */
+
+float App_ReadBatteryVoltage()
+{
+    unsigned int adc_battery_code;
+
+    float adc_battery_voltage;
+    float calculated_battery_voltage;
+
+    adc_battery_code =
+        App_ADC_Average(0);
+
+    adc_battery_voltage =
+        ((float)adc_battery_code *
+         CFG_VDD_V) /
+        CFG_ADC_TOP;
+
+    calculated_battery_voltage =
+        adc_battery_voltage *
+        CFG_BAT_DIVISOR;
+
+    calculated_battery_voltage *=
+        CFG_BAT_GAIN_CORR;
+
+    return calculated_battery_voltage;
+}
+
+
+/* =============================================================
+   PORCENTAJE DE BATERIA
+   ============================================================= */
+
+unsigned short App_BatteryPercent(float measured_voltage)
+{
+    float calculated_percent;
+
+    if(measured_voltage >= 4.20)
+    {
+        return 100;
+    }
+
+    if(measured_voltage <= 3.40)
+    {
+        return 0;
+    }
+
+    if(measured_voltage >= 4.10)
+    {
+        calculated_percent =
+            90.0 +
+            ((measured_voltage - 4.10) /
+             0.10) *
+            10.0;
+    }
+
+    else if(measured_voltage >= 4.00)
+    {
+        calculated_percent =
+            80.0 +
+            ((measured_voltage - 4.00) /
+             0.10) *
+            10.0;
+    }
+
+    else if(measured_voltage >= 3.90)
+    {
+        calculated_percent =
+            70.0 +
+            ((measured_voltage - 3.90) /
+             0.10) *
+            10.0;
+    }
+
+    else if(measured_voltage >= 3.80)
+    {
+        calculated_percent =
+            55.0 +
+            ((measured_voltage - 3.80) /
+             0.10) *
+            15.0;
+    }
+
+    else if(measured_voltage >= 3.70)
+    {
+        calculated_percent =
+            40.0 +
+            ((measured_voltage - 3.70) /
+             0.10) *
+            15.0;
+    }
+
+    else if(measured_voltage >= 3.60)
+    {
+        calculated_percent =
+            20.0 +
+            ((measured_voltage - 3.60) /
+             0.10) *
+            20.0;
+    }
+
+    else if(measured_voltage >= 3.50)
+    {
+        calculated_percent =
+            10.0 +
+            ((measured_voltage - 3.50) /
+             0.10) *
+            10.0;
+    }
+
+    else
+    {
+        calculated_percent =
+            ((measured_voltage - 3.40) /
+             0.10) *
+            10.0;
+    }
+
+    if(calculated_percent > 100.0)
+    {
+        calculated_percent = 100.0;
+    }
+
+    if(calculated_percent < 0.0)
+    {
+        calculated_percent = 0.0;
+    }
+
+    return
+        (unsigned short)
+        (calculated_percent + 0.5);
+}
+
+
+/* =============================================================
+   ESTADO TP4056
+   ============================================================= */
+
+unsigned short App_CheckCharging()
+{
+    /*
+     * CHRG activo en LOW:
+     *
+     * RB0 = 0 -> cargando
+     * RB0 = 1 -> no cargando
+     */
+
+    if(PORTB.B0 == 0)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+/* =============================================================
+   TIEMPO ESTIMADO DE CARGA
+   ============================================================= */
+
+long App_CalculateChargeSeconds(unsigned short battery_pct)
+{
+    float missing_capacity_mah;
+    float calculated_hours;
+    float calculated_seconds;
+
+    if(battery_pct >= 100)
+    {
+        return 0;
+    }
+
+    missing_capacity_mah =
+        CFG_BAT_CAPACITY_MAH *
+        (100.0 - (float)battery_pct) /
+        100.0;
+
+    calculated_hours =
+        missing_capacity_mah /
+        CFG_CHARGE_CURRENT_MA;
+
+    calculated_hours *=
+        CFG_CHARGE_TIME_FACTOR;
+
+    calculated_seconds =
+        calculated_hours *
+        3600.0;
+
+    return
+        (long)calculated_seconds;
+}
+
+
+/* =============================================================
+   TIEMPO ESTIMADO DE DESCARGA
+   ============================================================= */
+
+long App_CalculateDischargeSeconds(unsigned short battery_pct)
+{
+    float remaining_capacity_mah;
+    float calculated_hours;
+
+    if(CFG_SYSTEM_CURRENT_MA <= 0.01)
+    {
+        return -1;
+    }
+
+    remaining_capacity_mah =
+        CFG_BAT_CAPACITY_MAH *
+        ((float)battery_pct / 100.0);
+
+    calculated_hours =
+        remaining_capacity_mah /
+        CFG_SYSTEM_CURRENT_MA;
+
+    return
+        (long)(calculated_hours * 3600.0);
+}
+
+
+/* =============================================================
+   CONTROL CORRIENTE DE MEDICION
+   ============================================================= */
+
+void App_MeasureCurrentOn()
+{
+    /*
+     * RD0 -> 3 V aproximadamente.
+     */
+    LATD.B0 = 1;
+}
+
+
+/* ------------------------------------------------------------- */
+
+void App_MeasureCurrentOff()
+{
+    LATD.B0 = 0;
+}
+
+
+/* =============================================================
+   MEDICION DE RESISTENCIA
+   ============================================================= */
+
+float App_ReadResistance()
+{
+    unsigned int adc_resistance_code;
+
+    float ina_output_voltage;
+    float measured_resistance;
+
+    /*
+     * Activar corriente de 60 mA.
+     */
+    App_MeasureCurrentOn();
+
+    /*
+     * Esperar estabilizacion.
+     */
+    Delay_ms(10);
+
+    /*
+     * AN1 = VOLT_R.
+     */
+    adc_resistance_code =
+        App_ADC_Average(1);
+
+    /*
+     * Apagar inmediatamente corriente.
+     */
+    App_MeasureCurrentOff();
+
+    /*
+     * Convertir ADC a voltios.
+     */
+    ina_output_voltage =
+        ((float)adc_resistance_code *
+         CFG_VDD_V) /
+        CFG_ADC_TOP;
+
+    /*
+     * R =
+     * (VOUT - VREF) /
+     * (GANANCIA * CORRIENTE)
+     */
+    measured_resistance =
+        (ina_output_voltage -
+         CFG_INA_REFERENCE_V) /
+        (CFG_INA_GAIN *
+         CFG_TEST_CURRENT_A);
+
+    /*
+     * Calibracion.
+     */
+    measured_resistance =
+        measured_resistance -
+        CFG_RES_OFFSET_OHM;
+
+    measured_resistance =
+        measured_resistance *
+        CFG_RES_GAIN_CORR;
+
+    if(measured_resistance < 0.0)
+    {
+        measured_resistance = 0.0;
+    }
+
+    return measured_resistance;
+}
+
+
+/* =============================================================
+   ESP8266 - ENVIAR LINEA
+   ============================================================= */
+
+void App_ESP_SendLine(char *message_buffer)
+{
+    UART1_Write_Text(message_buffer);
+
+    UART1_Write(13);
+    UART1_Write(10);
+}
+
+
+/* =============================================================
+   ESP8266 - ESPERAR RESPUESTA
+   ============================================================= */
+
+unsigned short App_ESP_WaitFor(char *expected_buffer,
+                               unsigned int wait_time_ms)
+{
+    unsigned short match_position;
+    unsigned short expected_length;
+
+    char received_character;
+
+    match_position = 0;
+
+    expected_length =
+        strlen(expected_buffer);
+
+    while(wait_time_ms > 0)
+    {
+        if(UART1_Data_Ready())
+        {
+            received_character =
+                UART1_Read();
+
+            if(received_character ==
+               expected_buffer[match_position])
+            {
+                match_position++;
+
+                if(match_position ==
+                   expected_length)
+                {
+                    return 1;
+                }
+            }
+            else
+            {
+                if(received_character ==
+                   expected_buffer[0])
+                {
+                    match_position = 1;
+                }
+                else
+                {
+                    match_position = 0;
+                }
+            }
+        }
+
+        Delay_ms(1);
+
+        wait_time_ms--;
+    }
+
+    return 0;
+}
+
+
+/* =============================================================
+   VACIAR UART
+   ============================================================= */
+
+void App_ESP_ClearBuffer()
+{
+    while(UART1_Data_Ready())
+    {
+        UART1_Read();
+    }
+}
+
+
+/* =============================================================
+   CONECTAR WIFI
+   ============================================================= */
+
+unsigned short App_ESP_ConnectWiFi()
+{
+    App_ESP_ClearBuffer();
+
+    /*
+     * Prueba AT.
+     */
+    App_ESP_SendLine("AT");
+
+    if(!App_ESP_WaitFor("OK", 3000))
+    {
+        return 0;
+    }
+
+    /*
+     * Desactivar eco.
+     */
+    App_ESP_SendLine("ATE0");
+
+    App_ESP_WaitFor("OK", 2000);
+
+    /*
+     * Modo Station.
+     */
+    App_ESP_SendLine("AT+CWMODE=1");
+
+    if(!App_ESP_WaitFor("OK", 3000))
+    {
+        return 0;
+    }
+
+    /*
+     * Conexion unica.
+     */
+    App_ESP_SendLine("AT+CIPMUX=0");
+
+    App_ESP_WaitFor("OK", 3000);
+
+    /*
+     * Buffer SSL.
+     * Si firmware antiguo responde ERROR,
+     * continuamos.
+     */
+    App_ESP_SendLine("AT+CIPSSLSIZE=4096");
+
+    App_ESP_WaitFor("OK", 2000);
+
+    /*
+     * AT+CWJAP="SSID","PASSWORD"
+     */
+    strcpy(app_command_buffer,
+           "AT+CWJAP=\"");
+
+    strcat(app_command_buffer,
+           CFG_WIFI_SSID);
+
+    strcat(app_command_buffer,
+           "\",\"");
+
+    strcat(app_command_buffer,
+           CFG_WIFI_PASSWORD);
+
+    strcat(app_command_buffer,
+           "\"");
+
+    App_ESP_SendLine(app_command_buffer);
+
+    if(!App_ESP_WaitFor("OK", 30000))
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/* =============================================================
+   CONSTRUIR JSON
+   ============================================================= */
+
+void App_BuildJSON()
+{
+    strcpy(app_json_buffer,
+           "{");
+
+    /*
+     * device_id
+     */
+    strcat(app_json_buffer,
+           "\"device_id\":\"");
+
+    strcat(app_json_buffer,
+           CFG_DEVICE_ID);
+
+    strcat(app_json_buffer,
+           "\",");
+
+
+    /*
+     * resistance_ohm
+     */
+    strcat(app_json_buffer,
+           "\"resistance_ohm\":");
+
+    if(app_resistance_valid)
+    {
+        App_AppendFloat(
+            app_json_buffer,
+            app_resistance_ohm
+        );
+    }
+    else
+    {
+        strcat(app_json_buffer,
+               "null");
+    }
+
+    strcat(app_json_buffer,
+           ",");
+
+
+    /*
+     * battery_voltage_v
+     */
+    strcat(app_json_buffer,
+           "\"battery_voltage_v\":");
+
+    App_AppendFloat(
+        app_json_buffer,
+        app_battery_voltage
+    );
+
+    strcat(app_json_buffer,
+           ",");
+
+
+    /*
+     * battery_percent
+     */
+    strcat(app_json_buffer,
+           "\"battery_percent\":");
+
+    App_AppendInteger(
+        app_json_buffer,
+        app_battery_percent
+    );
+
+    strcat(app_json_buffer,
+           ",");
+
+
+    /*
+     * charging
+     */
+    strcat(app_json_buffer,
+           "\"charging\":");
+
+    if(app_is_charging)
+    {
+        strcat(app_json_buffer,
+               "true");
+    }
+    else
+    {
+        strcat(app_json_buffer,
+               "false");
+    }
+
+    strcat(app_json_buffer,
+           ",");
+
+
+    /*
+     * charge_time_remaining_s
+     */
+    strcat(app_json_buffer,
+           "\"charge_time_remaining_s\":");
+
+    if(app_charge_seconds >= 0)
+    {
+        App_AppendLong(
+            app_json_buffer,
+            app_charge_seconds
+        );
+    }
+    else
+    {
+        strcat(app_json_buffer,
+               "null");
+    }
+
+    strcat(app_json_buffer,
+           ",");
+
+
+    /*
+     * discharge_time_remaining_s
+     */
+    strcat(app_json_buffer,
+           "\"discharge_time_remaining_s\":");
+
+    if(app_discharge_seconds >= 0)
+    {
+        App_AppendLong(
+            app_json_buffer,
+            app_discharge_seconds
+        );
+    }
+    else
+    {
+        strcat(app_json_buffer,
+               "null");
+    }
+
+    strcat(app_json_buffer,
+           ",");
+
+
+    /*
+     * measurement_enabled
+     */
+    strcat(app_json_buffer,
+           "\"measurement_enabled\":");
+
+    if(app_measure_allowed)
+    {
+        strcat(app_json_buffer,
+               "true");
+    }
+    else
+    {
+        strcat(app_json_buffer,
+               "false");
+    }
+
+    strcat(app_json_buffer,
+           ",");
+
+
+    /*
+     * status
+     */
+    strcat(app_json_buffer,
+           "\"status\":\"");
+
+    strcat(app_json_buffer,
+           app_state_buffer);
+
+    strcat(app_json_buffer,
+           "\"");
+
+    strcat(app_json_buffer,
+           "}");
+}
+
+
+/* =============================================================
+   CONSTRUIR PETICION HTTP
+   ============================================================= */
+
+void App_BuildHTTPRequest()
+{
+    char body_length_buffer[12];
+
+    unsigned int body_size;
+
+    body_size =
+        strlen(app_json_buffer);
+
+    IntToStr(body_size,
+             body_length_buffer);
+
+    App_TrimLeft(body_length_buffer);
+
+
+    strcpy(
+        app_http_buffer,
+        "POST /rest/v1/measurements HTTP/1.1\r\n"
+    );
+
+
+    strcat(
+        app_http_buffer,
+        "Host: "
+    );
+
+    strcat(
+        app_http_buffer,
+        CFG_SUPABASE_HOST
+    );
+
+    strcat(
+        app_http_buffer,
+        "\r\n"
+    );
+
+
+    strcat(
+        app_http_buffer,
+        "apikey: "
+    );
+
+    strcat(
+        app_http_buffer,
+        CFG_SUPABASE_KEY
+    );
+
+    strcat(
+        app_http_buffer,
+        "\r\n"
+    );
+
+
+    strcat(
+        app_http_buffer,
+        "Content-Type: application/json\r\n"
+    );
+
+
+    strcat(
+        app_http_buffer,
+        "Prefer: return=minimal\r\n"
+    );
+
+
+    strcat(
+        app_http_buffer,
+        "Content-Length: "
+    );
+
+    strcat(
+        app_http_buffer,
+        body_length_buffer
+    );
+
+    strcat(
+        app_http_buffer,
+        "\r\n"
+    );
+
+
+    strcat(
+        app_http_buffer,
+        "Connection: close\r\n"
+    );
+
+
+    /*
+     * Fin de encabezados HTTP.
+     */
+    strcat(
+        app_http_buffer,
+        "\r\n"
+    );
+
+
+    /*
+     * JSON.
+     */
+    strcat(
+        app_http_buffer,
+        app_json_buffer
+    );
+}
+
+
+/* =============================================================
+   INSERTAR EN SUPABASE
+   ============================================================= */
+
+unsigned short App_SupabaseInsert()
+{
+    unsigned int request_size;
+
+    char request_size_buffer[12];
+
+
+    App_BuildHTTPRequest();
+
+
+    /*
+     * Conexion TLS.
+     */
+    strcpy(
+        app_command_buffer,
+        "AT+CIPSTART=\"SSL\",\""
+    );
+
+    strcat(
+        app_command_buffer,
+        CFG_SUPABASE_HOST
+    );
+
+    strcat(
+        app_command_buffer,
+        "\",443"
+    );
+
+    App_ESP_SendLine(
+        app_command_buffer
+    );
+
+
+    /*
+     * Esperar establecimiento.
+     */
+    if(!App_ESP_WaitFor("CONNECT",
+                        15000))
+    {
+        App_ESP_SendLine(
+            "AT+CIPCLOSE"
+        );
+
+        Delay_ms(500);
+
+        return 0;
+    }
+
+
+    /*
+     * Longitud HTTP completa.
+     */
+    request_size =
+        strlen(app_http_buffer);
+
+    IntToStr(
+        request_size,
+        request_size_buffer
+    );
+
+    App_TrimLeft(
+        request_size_buffer
+    );
+
+
+    /*
+     * AT+CIPSEND=...
+     */
+    strcpy(
+        app_command_buffer,
+        "AT+CIPSEND="
+    );
+
+    strcat(
+        app_command_buffer,
+        request_size_buffer
+    );
+
+    App_ESP_SendLine(
+        app_command_buffer
+    );
+
+
+    if(!App_ESP_WaitFor(">",
+                        5000))
+    {
+        App_ESP_SendLine(
+            "AT+CIPCLOSE"
+        );
+
+        return 0;
+    }
+
+
+    /*
+     * Enviar HTTP.
+     */
+    UART1_Write_Text(
+        app_http_buffer
+    );
+
+
+    /*
+     * ESP confirma envio.
+     */
+    if(!App_ESP_WaitFor("SEND OK",
+                        10000))
+    {
+        App_ESP_SendLine(
+            "AT+CIPCLOSE"
+        );
+
+        return 0;
+    }
+
+
+    /*
+     * Supabase/PostgREST:
+     * 201 = insercion correcta.
+     */
+    if(!App_ESP_WaitFor("201",
+                        12000))
+    {
+        App_ESP_SendLine(
+            "AT+CIPCLOSE"
+        );
+
+        return 0;
+    }
+
+
+    App_ESP_SendLine(
+        "AT+CIPCLOSE"
+    );
+
+    App_ESP_WaitFor(
+        "OK",
+        2000
+    );
+
+    return 1;
+}
+
+
+/* =============================================================
+   INICIALIZACION DEL HARDWARE
+   ============================================================= */
+
+void App_HardwareInit()
+{
+    /*
+     * Oscilador interno 16 MHz.
+     */
+    OSCCON = 0x72;
+
+    Delay_ms(20);
+
+
+    /*
+     * Latches.
+     */
+    LATA = 0x00;
+    LATB = 0x00;
+    LATC = 0x00;
+    LATD = 0x00;
+    LATE = 0x00;
+
+
+    /*
+     * ANCON0:
+     *
+     * AN0 = analogico
+     * AN1 = analogico
+     * AN2...AN7 = digital
+     *
+     * En PIC18F45K80:
+     * bit = 1 -> analogico.
+     */
+    ANCON0 = 0x03;
+
+    /*
+     * AN8...AN14 digitales.
+     */
+    ANCON1 = 0x00;
+
+
+    /*
+     * Comparadores apagados.
+     */
+    CM1CON = 0x00;
+    CM2CON = 0x00;
+
+
+    /*
+     * RA0 = N_BAT entrada.
+     */
+    TRISA.B0 = 1;
+
+    /*
+     * RA1 = VOLT_R entrada.
+     */
+    TRISA.B1 = 1;
+
+
+    /*
+     * RB0 = CHRG entrada.
+     */
+    TRISB.B0 = 1;
+
+
+    /*
+     * UART1.
+     */
+    TRISC.B6 = 0;
+    TRISC.B7 = 1;
+
+
+    /*
+     * RD0 = MED_EN salida.
+     */
+    TRISD.B0 = 0;
+
+    App_MeasureCurrentOff();
+
+
+    /*
+     * ADC.
+     */
+    ADC_Init();
+
+    Delay_ms(10);
+
+
+    /*
+     * UART ESP-01.
+     */
+    UART1_Init(115200);
+
+    Delay_ms(1000);
+}
+
+
+/* =============================================================
+   PROGRAMA PRINCIPAL
+   ============================================================= */
+
+void main()
+{
+    app_low_battery_latch = 0;
+    app_wifi_ready = 0;
+    app_measure_allowed = 0;
+    app_resistance_valid = 0;
+
+    App_HardwareInit();
+
+
+    /*
+     * Primera conexion WiFi.
+     */
+    app_wifi_ready =
+        App_ESP_ConnectWiFi();
+
+
+    while(1)
+    {
+        /*
+         * 1. Voltaje bateria.
+         */
+        app_battery_voltage =
+            App_ReadBatteryVoltage();
+
+
+        /*
+         * 2. Porcentaje bateria.
+         */
+        app_battery_percent =
+            App_BatteryPercent(
+                app_battery_voltage
+            );
+
+
+        /*
+         * 3. Histeresis bateria.
+         */
+        if(app_battery_voltage <=
+           CFG_BAT_LOW_V)
+        {
+            app_low_battery_latch = 1;
+        }
+
+
+        if(app_battery_voltage >=
+           CFG_BAT_RESTORE_V)
+        {
+            app_low_battery_latch = 0;
+        }
+
+
+        /*
+         * 4. Estado TP4056.
+         */
+        app_is_charging =
+            App_CheckCharging();
+
+
+        /*
+         * Por defecto no hay medida valida.
+         */
+        app_resistance_valid = 0;
+
+
+        /*
+         * 5. Estado general.
+         */
+        if(app_is_charging)
+        {
+            App_MeasureCurrentOff();
+
+            app_measure_allowed = 0;
+            app_resistance_valid = 0;
+
+            strcpy(
+                app_state_buffer,
+                "CHARGING"
+            );
+        }
+
+        else if(app_low_battery_latch)
+        {
+            App_MeasureCurrentOff();
+
+            app_measure_allowed = 0;
+            app_resistance_valid = 0;
+
+            strcpy(
+                app_state_buffer,
+                "LOW_BATTERY"
+            );
+        }
+
+        else
+        {
+            app_measure_allowed = 1;
+
+            /*
+             * 6. Medicion resistencia.
+             */
+            app_resistance_ohm =
+                App_ReadResistance();
+
+
+            if(app_resistance_ohm >
+               CFG_MAX_RESISTANCE_OHM)
+            {
+                app_resistance_valid = 0;
+
+                strcpy(
+                    app_state_buffer,
+                    "OVER_RANGE"
+                );
+            }
+            else
+            {
+                app_resistance_valid = 1;
+
+                strcpy(
+                    app_state_buffer,
+                    "OK"
+                );
+            }
+        }
+
+
+        /*
+         * 7. Tiempo carga / descarga.
+         */
+        if(app_is_charging)
+        {
+            app_charge_seconds =
+                App_CalculateChargeSeconds(
+                    app_battery_percent
+                );
+
+            app_discharge_seconds = -1;
+        }
+        else
+        {
+            app_charge_seconds = -1;
+
+            app_discharge_seconds =
+                App_CalculateDischargeSeconds(
+                    app_battery_percent
+                );
+        }
+
+
+        /*
+         * 8. Construir JSON.
+         */
+        App_BuildJSON();
+
+
+        /*
+         * 9. Reconectar WiFi si hace falta.
+         */
+        if(!app_wifi_ready)
+        {
+            app_wifi_ready =
+                App_ESP_ConnectWiFi();
+        }
+
+
+        /*
+         * 10. Subir a Supabase.
+         */
+        if(app_wifi_ready)
+        {
+            if(!App_SupabaseInsert())
+            {
+                app_wifi_ready = 0;
+            }
+        }
+
+
+        /*
+         * 11. Espera.
+         */
+        Delay_ms(
+            CFG_UPLOAD_DELAY_MS
+        );
+    }
+}

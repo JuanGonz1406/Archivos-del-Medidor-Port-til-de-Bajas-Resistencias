@@ -1,0 +1,75 @@
+CARCASA 3D - MEDIDOR DE BAJAS RESISTENCIAS, 4 HILOS KELVIN
+=====================================================================
+Versión 1.0 — diseño conceptual compatible con Autodesk Fusion 360.
+
+ENTREGABLES
+-----------
+Carcasa_Kelvin_ENSAMBLE.step   Modelo CAD de ensamble (incluye partes de referencia).
+Carcasa_Kelvin_BASE.step       Base editable por modelado directo en Fusion 360.
+Carcasa_Kelvin_TAPA.step       Tapa editable por modelado directo en Fusion 360.
+Carcasa_Kelvin_BASE.stl        Base triangulada para laminador 3D.
+Carcasa_Kelvin_TAPA.stl        Tapa triangulada para laminador 3D.
+Carcasa_Kelvin_PRESENTACION.png    Vista cerrada y explotada.
+Carcasa_Kelvin_3D_CERRADA.png      Render cerrado.
+Carcasa_Kelvin_3D_EXPLOTADA.png    Render explotado.
+Carcasa_Kelvin_3D_LATERAL.png      Vista desde lateral opuesto.
+carcasa_kelvin_fusion.py      Generador paramétrico CadQuery (requiere CadQuery).
+
+DIMENSIONES [mm] - PRELIMINARES
+-------------------------------
+Dimensiones totales del gabinete       82.0 x 68.0 x 35.2
+Base                                    82.0 x 68.0 x 32.0
+Tapa                                    82.0 x 68.0 x  3.2
+Pared lateral                           2.5
+Fondo                                   2.4
+PCB de referencia                     70.0 x 52.0 x  1.6
+Reserva batería LiPo                  48.0 x 34.0 x  7.0 aprox.
+Diámetro aproximado de paso banana      8.1
+Separación entre centros banana        12.5
+Tornillería                             4 x M2 (agujeros piloto 1.65)
+
+PRECAUCIONES / DATOS PENDIENTES
+-------------------------------
+1. EL ARCHIVO DEL CIRCUITO EN EL INFORME NO FIJA EL LARGO, ANCHO NI EL
+   ESPESOR REALES DE PCB: las dimensiones se estimaron de la captura KiCad,
+   utilizando la cota 15.5 mm entre los dos taladros de la huella banana.
+   ANTES DE IMPRIMIR, exportar el contorno real desde KiCad (.kicad_pcb o DXF).
+2. La boca y geometría de los conectores banana deben cotejarse con
+   la ficha técnica real de los conectores que se vayan a soldar.
+3. Se reservó abertura lateral para USB-C y un interruptor. SUS POSICIONES
+   SE CONSIDERAN PROVISIONALES porque las capturas no permiten acotarlas.
+4. La batería LiPo de 2000 mAh se propone en el informe, pero sin tamaño
+   físico final. Verificar las dimensiones de la celda con protección,
+   cable y salida del conector. Nunca comprimir, perforar o aprisionar la celda.
+5. No se identifican agujeros de tornillos de PCB: la carcasa usa apoyos
+   periféricos y no supone taladros en la tarjeta. Fijación definitiva de
+   PCB debe verificarse sobre la pieza física (sin presionar componentes).
+6. Los componentes 3D en el STEP de ensamble son PRISMAS DE REFERENCIA,
+   no modelos certificados ni una reproducción exacta de las librerías 3D.
+7. Se ha verificado que los STL de base y tapa son piezas cerradas (watertight).
+   Falta verificación de interferencias sobre el PCB real / componentes reales.
+
+ABRIR EN AUTODESK FUSION
+-----------------------
+1. Abrir un proyecto y usar Panel de datos > Cargar/Upload.
+2. Seleccionar 'Carcasa_Kelvin_ENSAMBLE.step' para revisar el conjunto.
+3. Para editar o fabricar cada pieza, importar los STEP BASE y TAPA.
+4. Fusion permite modificaciones por modelado directo a STEP; el historial
+   paramétrico original se mantiene en el script de CadQuery, no en el STEP.
+5. Si se desea archivo nativo .f3d, guardar el diseño importado desde Fusion.
+
+IMPRESIÓN 3D - ORIENTACIÓN PROPUESTA
+-----------------------------------
+- Base: orientar su cara inferior plana sobre la cama.
+- Tapa: orientar cara interior plana sobre la cama para mantener legibles
+  los grabados en la superficie exterior.
+- Material preliminar: PETG o PLA; PETG soporta mejor ambientes calurosos.
+- Capas 0.2 mm, 3-4 paredes y 20-30% relleno como punto de partida.
+- Probar el ajuste de los agujeros M2 y las entradas banana antes de
+  instalar la electrónica. No apretar tornillos en exceso.
+
+REFERENCIAS USADAS
+------------------
+- Capturas de KiCad suministradas por el usuario (2D y 3D PCB)
+- Esquemático y archivo Informeresistencia.tex proporcionados
+- Fotografía de las bases banana hembra de PCB
